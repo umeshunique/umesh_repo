@@ -1,1 +1,1 @@
-create table sales_teams (id int ,name char(93)); 
+-- Write your SQL script here

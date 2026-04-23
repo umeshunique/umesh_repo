@@ -1,1 +1,1 @@
-create table wave(id int ,name char(36));
+-- Write your SQL script heredfdf

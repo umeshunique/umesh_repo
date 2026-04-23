@@ -1,0 +1,177 @@
+name: LLM PR Review Gate
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+concurrency:
+  group: llm-pr-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  llm-review:
+    name: LLM review and block on issues
+    if: ${{ github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run LLM PR review
+        uses: actions/github-script@v7
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LLM_REVIEW_MODEL: ${{ vars.LLM_REVIEW_MODEL }}
+        with:
+          script: |
+            const apiKey = (process.env.OPENAI_API_KEY || '').trim();
+            if (!apiKey) {
+              core.setFailed(
+                'Missing OPENAI_API_KEY secret. Add it in repository secrets to enable LLM PR review gate.'
+              );
+              return;
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+            const pullNumber = pr.number;
+            const model = (process.env.LLM_REVIEW_MODEL || 'gpt-4o-mini').trim();
+
+            const changedFiles = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: pullNumber,
+              per_page: 100,
+            });
+
+            const MAX_FILES = 50;
+            const MAX_PATCH_CHARS = 7000;
+            const diffPayload = changedFiles
+              .filter((file) => ['added', 'modified', 'renamed'].includes(file.status))
+              .slice(0, MAX_FILES)
+              .map((file) => ({
+                filename: file.filename,
+                status: file.status,
+                additions: file.additions,
+                deletions: file.deletions,
+                changes: file.changes,
+                patch: (file.patch || '').slice(0, MAX_PATCH_CHARS),
+              }));
+
+            const prompt = [
+              'You are a strict senior engineer reviewing a pull request.',
+              'Review only for meaningful, high-confidence issues:',
+              '- correctness bugs',
+              '- security flaws',
+              '- data corruption/data loss risk',
+              '- breaking behavior changes',
+              '- unsafe SQL/data migration mistakes',
+              '- missing critical validation or error handling',
+              '',
+              'Ignore style, formatting, naming, and low-confidence suggestions.',
+              'Respond with JSON only in this exact schema:',
+              '{"decision":"APPROVE|REQUEST_CHANGES","summary":"string","issues":[{"title":"string","severity":"high|medium","file":"string","reason":"string","fix":"string"}]}',
+              '',
+              `PR title: ${pr.title}`,
+              `Base branch: ${pr.base.ref}`,
+              `Head branch: ${pr.head.ref}`,
+              `Files included: ${diffPayload.length}`,
+              '',
+              'Changed files and patches:',
+              JSON.stringify(diffPayload),
+            ].join('\n');
+
+            const llmRes = await fetch('https://api.openai.com/v1/responses', {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${apiKey}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                model,
+                input: prompt,
+              }),
+            });
+
+            if (!llmRes.ok) {
+              const errorBody = await llmRes.text();
+              core.setFailed(
+                `LLM request failed (${llmRes.status}): ${errorBody.slice(0, 1200)}`
+              );
+              return;
+            }
+
+            const llmData = await llmRes.json();
+            const outputText = (llmData.output_text || '').trim();
+
+            if (!outputText) {
+              core.setFailed('LLM returned an empty response.');
+              return;
+            }
+
+            let result;
+            try {
+              result = JSON.parse(outputText);
+            } catch (error) {
+              const jsonMatch = outputText.match(/\{[\s\S]*\}/);
+              if (!jsonMatch) {
+                core.setFailed(`Could not parse LLM JSON response: ${outputText.slice(0, 1200)}`);
+                return;
+              }
+              result = JSON.parse(jsonMatch[0]);
+            }
+
+            const decision = String(result.decision || '').toUpperCase();
+            const summary = String(result.summary || 'LLM review completed.');
+            const issues = Array.isArray(result.issues) ? result.issues : [];
+
+            if (decision === 'REQUEST_CHANGES' || issues.length > 0) {
+              const issueLines = issues.slice(0, 20).map((issue, index) => {
+                const severity = issue.severity || 'medium';
+                return [
+                  `${index + 1}. [${severity}] ${issue.title || 'Issue found'}`,
+                  `   - File: ${issue.file || 'unknown'}`,
+                  `   - Why: ${issue.reason || 'No reason provided'}`,
+                  `   - Fix: ${issue.fix || 'Apply a safe fix and retest'}`,
+                ].join('\n');
+              });
+
+              const reviewBody = [
+                'Automated LLM review requested changes. Merge is blocked until issues are fixed.',
+                '',
+                `**Summary:** ${summary}`,
+                '',
+                '**Issues:**',
+                issueLines.length
+                  ? issueLines.join('\n')
+                  : '- LLM requested changes without a structured issue list.',
+                '',
+                'Push fixes to this PR branch. The gate will run again automatically.',
+              ].join('\n');
+
+              await github.rest.pulls.createReview({
+                owner,
+                repo,
+                pull_number: pullNumber,
+                event: 'REQUEST_CHANGES',
+                body: reviewBody,
+              });
+
+              core.setFailed('LLM found blocking issues.');
+              return;
+            }
+
+            core.info(`LLM approved PR review: ${summary}`);

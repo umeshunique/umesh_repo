@@ -1,1 +1,1 @@
-create table voltuswave(id int ,name char(36));
+create table sales (id int ,name char(93)); 

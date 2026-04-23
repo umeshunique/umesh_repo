@@ -1,1 +1,1 @@
-create table sales (id int ,name char(93)); 
+create table sales_teams (id int ,name char(93)); 

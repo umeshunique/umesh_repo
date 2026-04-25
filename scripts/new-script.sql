@@ -1,3 +1,4 @@
-create table sales (id int ,name char(93)); 
+-- Write your SQL script heresxcxcxcccsdsdsd
 
-umesh kumar select * from where 
+
+select * from country_master; 

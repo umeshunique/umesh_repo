@@ -1,2 +1,1 @@
-
-create table if not exists mahesh(id int );
+create table if not exists roshan(id int);
